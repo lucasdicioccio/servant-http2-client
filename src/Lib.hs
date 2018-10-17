@@ -5,12 +5,14 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving   #-}
 {-# LANGUAGE DeriveGeneric   #-}
 {-# LANGUAGE FlexibleContexts   #-}
+{-# LANGUAGE FlexibleInstances   #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE MultiParamTypeClasses   #-}
 module Lib
     ( someFunc
     ) where
 
+import           Data.IORef
 import           Control.Exception (throwIO)
 import           Control.Monad.Catch
 import           Control.Monad.IO.Class
@@ -106,7 +108,66 @@ performRequest req = do
     pure response
 
 performStreamingRequest :: Request -> H2ClientM StreamingResponse
-performStreamingRequest req = undefined
+performStreamingRequest req = do
+    H2ClientEnv authority http2client <- ask
+    let icfc = _incomingFlowControl http2client
+    let ocfc = _outgoingFlowControl http2client
+    let baseHeaders =
+            [ (":method", requestMethod req)
+            , (":scheme", "https")
+            , (":path", toStrict $ toLazyByteString $ requestPath req)
+            , (":authority", authority)
+            , ("Accept", ByteString.intercalate "," $ toList $ fmap renderHeader $ requestAccept req)
+            , ("User-Agent", "servant-http2-client/dev")
+            ]
+    let reqHeaders = [(CI.original h, hv) | (h,hv) <- toList (requestHeaders req)]
+    let (body,bodyheaders) = case requestBody req of
+            Nothing -> ("",[])
+            Just (RequestBodyBS bs, ct)  ->
+                (bs,[ ("Content-Type", renderHeader ct)
+                    , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
+                    ])
+            Just (RequestBodyLBS lbs, ct) -> let bs = toStrict lbs in
+                (bs,[ ("Content-Type", renderHeader ct)
+                    , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
+                    ])
+    let headersPairs = baseHeaders <> reqHeaders <> bodyheaders
+    let headersFlags = id
+    let resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
+
+    ret <- liftIO $ withHttp2Stream http2client $ \stream ->
+        let initStream =
+                headers stream headersPairs headersFlags
+            handler isfc osfc = do
+                isFinished <- newIORef False
+                let nextChunk = do
+                        done <- readIORef isFinished
+                        if done
+                        then pure ""
+                        else do
+                            ev <- _waitEvent stream
+                            case ev of
+                                (StreamDataEvent frameHeader dat) -> do
+                                    _addCredit isfc (ByteString.length dat)
+                                    _ <- _consumeCredit isfc (ByteString.length dat)
+                                    _ <- _updateWindow isfc
+                                    _addCredit icfc (ByteString.length dat)
+                                    _ <- _updateWindow icfc
+                                    when (testEndStream $ flags frameHeader) $
+                                        writeIORef isFinished True
+                                    pure dat
+                upload body setEndStream http2client ocfc stream osfc
+                pure $ StreamingResponse (\handleGenResponse -> do
+                    ev <- _waitEvent stream
+                    case ev of
+                        (StreamHeadersEvent frameHeader hdrs) -> do
+                             when (testEndStream $ flags frameHeader) $
+                                 writeIORef isFinished True
+                             let Just status = readMaybe . ByteString.unpack =<< lookup ":status" hdrs
+                             handleGenResponse $ Response (Status status "") (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ]) http20 nextChunk)
+        in (StreamDefinition initStream handler)
+    case ret of
+        Right ret -> pure ret
 
 h2client :: HasClient H2ClientM api => Proxy api -> Client H2ClientM api
 h2client api = api `clientIn` (Proxy :: Proxy H2ClientM)
@@ -121,17 +182,22 @@ instance MimeUnrender RawText Text where
 instance MimeUnrender OctetStream Text where
   mimeUnrender _ = pure . Encoding.decodeUtf8 . toStrict
 
+{-
+instance BuildFromStream Text (IO Text) where
+  buildFromStream (ResultStream next) = _
+-}
+
 --- usage ---
 type Http2Golang =
        "reqinfo" :> Get '[RawText] Text
-  :<|> "goroutines" :> Get '[RawText] Text
+  :<|> "goroutines" :> StreamGet NewlineFraming RawText (ResultStream Text)
   :<|> "ECHO" :> ReqBody '[RawText] Text :> Put '[OctetStream] Text
 
 myApi :: Proxy Http2Golang
 myApi = Proxy
 
 getExample :: H2ClientM Text
-getGoroutines :: H2ClientM Text
+getGoroutines :: H2ClientM (ResultStream Text)
 capitalize :: Text -> H2ClientM Text
 getExample :<|> getGoroutines :<|> capitalize = h2client myApi
 
@@ -142,8 +208,17 @@ someFunc = do
     let env = H2ClientEnv "http2.golang.org" client
     runH2ClientM getExample env >>= print
     runH2ClientM (capitalize "shout me something back") env >>= print
-    runH2ClientM getGoroutines env >>= print
+    runH2ClientM getGoroutines env >>= go
   where
+    go :: Either ServantError (ResultStream Text) -> IO ()
+    go (Left err) = print err
+    go (Right (ResultStream k)) = k $ \getResult ->
+       let loop = do
+            r <- getResult
+            case r of
+                Nothing -> return ()
+                Just x -> print x >> loop
+       in loop
     tlsParams = TLS.ClientParams {
           TLS.clientWantSessionResume    = Nothing
         , TLS.clientUseMaxFragmentLength = Nothing
