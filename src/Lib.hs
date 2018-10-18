@@ -32,6 +32,7 @@ import           GHC.Generics
 import           Servant.API
 import           Servant.Client.Core
 import           Servant.Client.Core.Internal.RunClient
+import           Network.HPACK
 import           Network.HTTP.Media.RenderHeader
 import           Network.HTTP2
 import           Network.HTTP2.Client
@@ -71,28 +72,11 @@ performRequest req = do
     H2ClientEnv authority http2client <- ask
     let icfc = _incomingFlowControl http2client
     let ocfc = _outgoingFlowControl http2client
-    let baseHeaders =
-            [ (":method", requestMethod req)
-            , (":scheme", "https")
-            , (":path", toStrict $ toLazyByteString $ requestPath req)
-            , (":authority", authority)
-            , ("Accept", ByteString.intercalate "," $ toList $ fmap renderHeader $ requestAccept req)
-            , ("User-Agent", "servant-http2-client/dev")
-            ]
-    let reqHeaders = [(CI.original h, hv) | (h,hv) <- toList (requestHeaders req)]
-    let (body,bodyheaders) = case requestBody req of
-            Nothing -> ("",[])
-            Just (RequestBodyBS bs, ct)  ->
-                (bs,[ ("Content-Type", renderHeader ct)
-                    , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
-                    ])
-            Just (RequestBodyLBS lbs, ct) -> let bs = toStrict lbs in
-                (bs,[ ("Content-Type", renderHeader ct)
-                    , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
-                    ])
-    let headersPairs = baseHeaders <> reqHeaders <> bodyheaders
     let headersFlags = id
     let resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
+
+    (bodyIO, headersPairs) <- liftIO $ makeRequest authority req
+    body <- liftIO $ bodyIO
     http2rsp <- liftIO $ withHttp2Stream http2client $ \stream ->
         let initStream =
                 headers stream headersPairs headersFlags
@@ -107,34 +91,41 @@ performRequest req = do
                         Response (Status status "") (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ]) http20 (fromStrict body)
     pure response
 
+makeRequest :: ByteString -> Request -> IO (IO ByteString, HeaderList)
+makeRequest authority req = do
+    let (bodyIO,bodyheaders) = case requestBody req of
+            Nothing -> (pure "",[])
+            Just (RequestBodyBS bs, ct)  ->
+                (pure bs, [ ("Content-Type", renderHeader ct)
+                          , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
+                          ])
+            Just (RequestBodyLBS lbs, ct) -> let bs = toStrict lbs in
+                (pure bs, [ ("Content-Type", renderHeader ct)
+                          , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
+                          ])
+    let headersPairs = baseHeaders <> reqHeaders <> bodyheaders
+    pure (bodyIO, headersPairs)
+  where
+    baseHeaders =
+        [ (":method", requestMethod req)
+        , (":scheme", "https")
+        , (":path", toStrict $ toLazyByteString $ requestPath req)
+        , (":authority", authority)
+        , ("Accept", ByteString.intercalate "," $ toList $ fmap renderHeader $ requestAccept req)
+        , ("User-Agent", "servant-http2-client/dev")
+        ]
+    reqHeaders = [(CI.original h, hv) | (h,hv) <- toList (requestHeaders req)]
+
 performStreamingRequest :: Request -> H2ClientM StreamingResponse
 performStreamingRequest req = do
     H2ClientEnv authority http2client <- ask
     let icfc = _incomingFlowControl http2client
     let ocfc = _outgoingFlowControl http2client
-    let baseHeaders =
-            [ (":method", requestMethod req)
-            , (":scheme", "https")
-            , (":path", toStrict $ toLazyByteString $ requestPath req)
-            , (":authority", authority)
-            , ("Accept", ByteString.intercalate "," $ toList $ fmap renderHeader $ requestAccept req)
-            , ("User-Agent", "servant-http2-client/dev")
-            ]
-    let reqHeaders = [(CI.original h, hv) | (h,hv) <- toList (requestHeaders req)]
-    let (body,bodyheaders) = case requestBody req of
-            Nothing -> ("",[])
-            Just (RequestBodyBS bs, ct)  ->
-                (bs,[ ("Content-Type", renderHeader ct)
-                    , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
-                    ])
-            Just (RequestBodyLBS lbs, ct) -> let bs = toStrict lbs in
-                (bs,[ ("Content-Type", renderHeader ct)
-                    , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
-                    ])
-    let headersPairs = baseHeaders <> reqHeaders <> bodyheaders
     let headersFlags = id
     let resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
 
+    (bodyIO, headersPairs) <- liftIO $ makeRequest authority req
+    body <- liftIO $ bodyIO
     ret <- liftIO $ withHttp2Stream http2client $ \stream ->
         let initStream =
                 headers stream headersPairs headersFlags
@@ -181,11 +172,6 @@ instance MimeUnrender RawText Text where
   mimeUnrender _ = pure . Encoding.decodeUtf8 . toStrict
 instance MimeUnrender OctetStream Text where
   mimeUnrender _ = pure . Encoding.decodeUtf8 . toStrict
-
-{-
-instance BuildFromStream Text (IO Text) where
-  buildFromStream (ResultStream next) = _
--}
 
 --- usage ---
 type Http2Golang =
