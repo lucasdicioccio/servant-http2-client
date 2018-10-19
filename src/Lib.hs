@@ -13,6 +13,7 @@ module Lib
     ) where
 
 import           Data.IORef
+import           Data.Foldable
 import           Control.Exception (throwIO)
 import           Control.Monad.Catch
 import           Control.Monad.IO.Class
@@ -21,9 +22,10 @@ import           Control.Monad.Error.Class   (MonadError (..))
 import           Control.Monad.Reader
 import           Data.Aeson (eitherDecode)
 import           Data.Binary.Builder (toLazyByteString)
+import           Data.ByteString.Builder
 import           Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
-import           Data.ByteString.Lazy (fromStrict, toStrict)
+import           Data.ByteString.Lazy (fromStrict, toStrict, toChunks)
 import           Data.Default.Class (def)
 import           Data.Foldable (toList)
 import           Data.Sequence (fromList)
@@ -67,42 +69,65 @@ instance RunClient H2ClientM where
 
 data H2ClientEnv = H2ClientEnv ByteString Http2Client
 
-performRequest :: Request -> H2ClientM Response
-performRequest req = do
-    H2ClientEnv authority http2client <- ask
-    let icfc = _incomingFlowControl http2client
-    let ocfc = _outgoingFlowControl http2client
-    let headersFlags = id
-    let resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
+type ByteSegments = (IO ByteString -> IO ()) -> IO ()
 
-    (bodyIO, headersPairs) <- liftIO $ makeRequest authority req
-    body <- liftIO $ bodyIO
-    http2rsp <- liftIO $ withHttp2Stream http2client $ \stream ->
-        let initStream =
-                headers stream headersPairs headersFlags
-            handler isfc osfc = do
-                upload body setEndStream http2client ocfc stream osfc
-                streamResult <- waitStream stream icfc resetPushPromises
-                pure $ fromStreamResult streamResult
-        in (StreamDefinition initStream handler)
-    let response = case http2rsp of
-            Right (Right (hdrs,body,_))
-                | let Just status = readMaybe . ByteString.unpack =<< lookup ":status" hdrs ->
-                        Response (Status status "") (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ]) http20 (fromStrict body)
-    pure response
+sendSegments http2client stream ocfc osfc segments =
+    segments go
+  where
+    go getChunk = do
+        dat <- getChunk
+        print dat
+        if ByteString.null dat
+        then sendData http2client stream setEndStream dat
+        else upload dat id http2client ocfc stream osfc
 
-makeRequest :: ByteString -> Request -> IO (IO ByteString, HeaderList)
+onlySegment :: ByteString -> ByteSegments
+onlySegment bs
+  | ByteString.null bs = \handle -> handle (pure "")
+  | otherwise          = \handle -> handle (pure bs) >> handle (pure "")
+
+multiSegments :: [ByteString] -> ByteSegments
+multiSegments []  = \handle -> handle (pure "")
+multiSegments bss = \handle -> do
+    traverse_ (handle . pure) (filter (not . ByteString.null) bss)
+    handle (pure "")
+
+makeRequest :: ByteString -> Request -> IO (ByteSegments, HeaderList)
 makeRequest authority req = do
-    let (bodyIO,bodyheaders) = case requestBody req of
-            Nothing -> (pure "",[])
-            Just (RequestBodyBS bs, ct)  ->
-                (pure bs, [ ("Content-Type", renderHeader ct)
-                          , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
-                          ])
-            Just (RequestBodyLBS lbs, ct) -> let bs = toStrict lbs in
-                (pure bs, [ ("Content-Type", renderHeader ct)
-                          , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
-                          ])
+    let go ct obj = case obj of
+            (RequestBodyBS bs)  -> pure $
+                (onlySegment bs,
+                    [ ("Content-Type", renderHeader ct)
+                    , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
+                    ])
+            (RequestBodyLBS lbs) ->
+                let bs = toStrict lbs in pure $
+                (onlySegment bs,
+                    [ ("Content-Type", renderHeader ct)
+                    , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
+                    ])
+            (RequestBodyBuilder n builder) ->
+                let bs = toLazyByteString builder in pure $
+                (multiSegments $ toChunks bs,
+                    [ ("Content-Type", renderHeader ct)
+                    , ("Content-Length", ByteString.pack $ show n)
+                    ])
+            (RequestBodyStream n act) -> pure $
+                (act,
+                    [ ("Content-Type", renderHeader ct)
+                    , ("Content-Length", ByteString.pack $ show n)
+                    ])
+            (RequestBodyStreamChunked act) -> pure $
+                (act,
+                    [ ("Content-Type", renderHeader ct)
+                    , ("Transfer-Encoding", "chunked")
+                    ])
+            (RequestBodyIO again) ->
+                again >>= go ct
+
+    (bodyIO,bodyheaders) <- case requestBody req of
+                                Nothing       -> pure (onlySegment "", [])
+                                (Just (r,ct)) -> go ct r
     let headersPairs = baseHeaders <> reqHeaders <> bodyheaders
     pure (bodyIO, headersPairs)
   where
@@ -116,6 +141,29 @@ makeRequest authority req = do
         ]
     reqHeaders = [(CI.original h, hv) | (h,hv) <- toList (requestHeaders req)]
 
+performRequest :: Request -> H2ClientM Response
+performRequest req = do
+    H2ClientEnv authority http2client <- ask
+    let icfc = _incomingFlowControl http2client
+    let ocfc = _outgoingFlowControl http2client
+    let headersFlags = id
+    let resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
+
+    (bodyIO, headersPairs) <- liftIO $ makeRequest authority req
+    http2rsp <- liftIO $ withHttp2Stream http2client $ \stream ->
+        let initStream =
+                headers stream headersPairs headersFlags
+            handler isfc osfc = do
+                sendSegments http2client stream ocfc osfc bodyIO
+                streamResult <- waitStream stream icfc resetPushPromises
+                pure $ fromStreamResult streamResult
+        in (StreamDefinition initStream handler)
+    let response = case http2rsp of
+            Right (Right (hdrs,body,_))
+                | let Just status = readMaybe . ByteString.unpack =<< lookup ":status" hdrs ->
+                        Response (Status status "") (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ]) http20 (fromStrict body)
+    pure response
+
 performStreamingRequest :: Request -> H2ClientM StreamingResponse
 performStreamingRequest req = do
     H2ClientEnv authority http2client <- ask
@@ -125,7 +173,6 @@ performStreamingRequest req = do
     let resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
 
     (bodyIO, headersPairs) <- liftIO $ makeRequest authority req
-    body <- liftIO $ bodyIO
     ret <- liftIO $ withHttp2Stream http2client $ \stream ->
         let initStream =
                 headers stream headersPairs headersFlags
@@ -147,7 +194,7 @@ performStreamingRequest req = do
                                     when (testEndStream $ flags frameHeader) $
                                         writeIORef isFinished True
                                     pure dat
-                upload body setEndStream http2client ocfc stream osfc
+                sendSegments http2client stream ocfc osfc bodyIO
                 pure $ StreamingResponse (\handleGenResponse -> do
                     ev <- _waitEvent stream
                     case ev of
