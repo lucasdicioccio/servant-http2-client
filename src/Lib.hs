@@ -76,7 +76,6 @@ sendSegments http2client stream ocfc osfc segments =
   where
     go getChunk = do
         dat <- getChunk
-        print dat
         if ByteString.null dat
         then sendData http2client stream setEndStream dat
         else upload dat id http2client ocfc stream osfc
