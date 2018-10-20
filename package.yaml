@@ -40,23 +40,6 @@ library:
   - -Wall
   - -Werror
 
-executables:
-  servant-http2-client-exe:
-    main:                Main.hs
-    source-dirs:         app
-    ghc-options:
-    - -threaded
-    - -rtsopts
-    - -with-rtsopts=-N
-    dependencies:
-    - aeson
-    - async
-    - data-default-class
-    - servant
-    - servant-http2-client
-    - servant-client-core
-    - tls
-
 tests:
   servant-http2-client-test:
     main:                Spec.hs
