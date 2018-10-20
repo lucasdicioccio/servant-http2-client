@@ -15,6 +15,7 @@ module Lib
 import           Data.IORef
 import           Data.Foldable
 import           Control.Exception (throwIO)
+import           Control.Monad (unless)
 import           Control.Monad.Catch
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Except
@@ -30,6 +31,8 @@ import qualified Data.ByteString.Lazy as LByteString
 import           Data.Default.Class (def)
 import           Data.Foldable (toList)
 import           Data.Sequence (fromList)
+import           Data.Text (Text)
+import qualified Data.Text as Text
 import           Data.Text.Encoding as Encoding
 import           GHC.Generics
 import           Servant.API
@@ -48,7 +51,6 @@ import qualified Data.CaseInsensitive as CI
 import           Text.Read
 
 import           Data.Aeson (FromJSON,ToJSON)
-import           Data.Text (Text)
 import           Data.Proxy
 
 newtype H2ClientM a = H2ClientM
@@ -154,6 +156,7 @@ makeRequest authority req = do
         ]
     reqHeaders = [(CI.original h, hv) | (h,hv) <- toList (requestHeaders req)]
 
+-- | Implementation of simple requests.
 performRequest :: Request -> H2ClientM Response
 performRequest req = do
     H2ClientEnv authority http2client <- ask
@@ -172,12 +175,31 @@ performRequest req = do
                 streamResult <- waitStream stream icfc resetPushPromises
                 pure $ fromStreamResult streamResult
         in (StreamDefinition initStream handler)
-    let response = case http2rsp of
+    case http2rsp of
             Right (Right (hdrs,body,_))
-                | let Just status = readMaybe . ByteString.unpack =<< lookup ":status" hdrs ->
-                        Response (Status status "") (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ]) http20 (fromStrict body)
-    pure response
+                | let Just status = lookupStatus hdrs -> do
+                    let response = mkResponse status hdrs body
+                    unless (status >= 200 && status < 300) $
+                        throwError $ FailureResponse response
+                    pure response
+                | otherwise -> do
+                    let response = mkResponse 0 hdrs body
+                    throwError $ DecodeFailure "no :status header" response
+            Left (TooMuchConcurrency _) ->
+                throwError $ Servant.Client.Core.ConnectionError "too many concurrent streams"
 
+            Right (Left err) ->
+                throwError $ Servant.Client.Core.ConnectionError $ "connection error: " <> (Text.pack $ show $ toErrorCodeId err)
+  where
+    mkResponse status hdrs body =
+        Response (Status status "")
+                 (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ])
+                 http20
+                 (fromStrict body)
+    lookupStatus = lookup ":status" >=> readMaybe . ByteString.unpack
+
+
+-- | Implementation of requests with streaming replies.
 performStreamingRequest :: Request -> H2ClientM StreamingResponse
 performStreamingRequest req = do
     H2ClientEnv authority http2client <- ask
