@@ -1,5 +1,5 @@
 name:                servant-http2-client
-version:             0.1.0.0
+version:             0.1.0.1
 github:              "lucasdicioccio/servant-http2-client"
 license:             BSD3
 author:              "Lucas DiCioccio"
@@ -16,7 +16,7 @@ category:            Web
 # To avoid duplicated efforts in documentation and dealing with the
 # complications of embedding Haddock markup inside cabal files, it is
 # common to point users to the README.md file.
-description:         Please see the README on GitHub at <https://github.com/githubuser/servant-http2-client#readme>
+description:         Please see the README on GitHub at <https://github.com/lucasdicioccio/servant-http2-client#readme>
 
 dependencies:
 - base >= 4.7 && < 5
@@ -38,7 +38,6 @@ library:
   source-dirs: src
   ghc-options:
   - -Wall
-  - -Werror
 
 tests:
   servant-http2-client-test:
