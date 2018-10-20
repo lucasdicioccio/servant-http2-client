@@ -1,18 +1,17 @@
 name:                servant-http2-client
 version:             0.1.0.0
-github:              "githubuser/servant-http2-client"
+github:              "lucasdicioccio/servant-http2-client"
 license:             BSD3
-author:              "Author name here"
-maintainer:          "example@example.com"
-copyright:           "2018 Author name here"
+author:              "Lucas DiCioccio"
+maintainer:          "lucas@dicioccio.fr"
+copyright:           "2018 Lucas DiCioccio"
 
 extra-source-files:
 - README.md
 - ChangeLog.md
 
-# Metadata used when publishing your package
-# synopsis:            Short description of your package
-# category:            Web
+synopsis:            Generate HTTP2 clients from Servant API descriptions.
+category:            Web
 
 # To avoid duplicated efforts in documentation and dealing with the
 # complications of embedding Haddock markup inside cabal files, it is
@@ -51,6 +50,7 @@ executables:
     - -with-rtsopts=-N
     dependencies:
     - aeson
+    - async
     - data-default-class
     - servant
     - servant-http2-client
@@ -66,4 +66,10 @@ tests:
     - -rtsopts
     - -with-rtsopts=-N
     dependencies:
+    - aeson
+    - async
+    - data-default-class
+    - servant
     - servant-http2-client
+    - servant-client-core
+    - tls
