@@ -1,61 +1,24 @@
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# LANGUAGE DataKinds      #-}
-{-# LANGUAGE TypeOperators  #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE InstanceSigs   #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving   #-}
-{-# LANGUAGE DeriveGeneric   #-}
-{-# LANGUAGE FlexibleContexts   #-}
-{-# LANGUAGE FlexibleInstances   #-}
-{-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE MultiParamTypeClasses   #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE TypeOperators  #-}
 
 module Main where
 
-import Network.HTTP2.Client.Servant
-
-import           Data.IORef
-import           Data.Foldable
-import           Control.Exception (throwIO)
-import           Control.Monad (unless)
-import           Control.Monad.Catch (MonadCatch, MonadThrow)
-import           Control.Monad.IO.Class
-import           Control.Monad.Trans.Except
-import           Control.Monad.Error.Class   (MonadError (..))
-import           Control.Monad.Reader
-import           Data.Aeson (eitherDecode)
-import           Data.Binary.Builder (toLazyByteString)
-import           Data.ByteString.Builder
-import           Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
-import           Data.ByteString.Lazy (fromStrict, toStrict, toChunks)
-import qualified Data.ByteString.Lazy as LByteString
+import           Data.ByteString.Lazy (fromStrict, toStrict)
 import           Data.Default.Class (def)
-import           Data.Foldable (toList)
-import           Data.Sequence (fromList)
 import           Data.Text (Text)
-import qualified Data.Text as Text
 import           Data.Text.Encoding as Encoding
-import           GHC.Generics
-import           Servant.API
-import           Servant.Client.Core
-import           Servant.Client.Core.Internal.RunClient
-import           Network.HPACK
-import           Network.HTTP.Media.RenderHeader
-import           Network.HTTP2
+import           Data.Proxy
 import           Network.HTTP2.Client
-import           Network.HTTP2.Client.Helpers
-import           Network.HTTP.Types.Status
-import           Network.HTTP.Types.Version
+import           Network.HTTP2.Client.Servant
 import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra.Cipher as TLS
-import qualified Data.CaseInsensitive as CI
-import           Text.Read
+import           Servant.API
+import           Servant.Client.Core
 
-import           Data.Aeson (FromJSON,ToJSON)
-import           Data.Proxy
-
---- usage ---
---
 data RawText
 instance Accept RawText where
   contentType _ = "text/plain"
@@ -100,7 +63,7 @@ main = do
     tlsParams = TLS.ClientParams {
           TLS.clientWantSessionResume    = Nothing
         , TLS.clientUseMaxFragmentLength = Nothing
-        , TLS.clientServerIdentification = ("http2.golang.org", ByteString.pack $ show "443")
+        , TLS.clientServerIdentification = ("http2.golang.org", ByteString.pack "443")
         , TLS.clientUseServerNameIndication = True
         , TLS.clientShared               = def
         , TLS.clientHooks                = def { TLS.onServerCertificate = \_ _ _ _ -> return []

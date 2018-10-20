@@ -55,6 +55,7 @@ executables:
     - -with-rtsopts=-N
     dependencies:
     - servant-http2-client
+    - servant-client-core
 
 tests:
   servant-http2-client-test:
