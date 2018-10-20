@@ -26,6 +26,7 @@ import           Data.ByteString.Builder
 import           Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.ByteString.Lazy (fromStrict, toStrict, toChunks)
+import qualified Data.ByteString.Lazy as LByteString
 import           Data.Default.Class (def)
 import           Data.Foldable (toList)
 import           Data.Sequence (fromList)
@@ -91,7 +92,10 @@ multiSegments bss = \handle -> do
     traverse_ (handle . pure) (filter (not . ByteString.null) bss)
     handle (pure "")
 
-makeRequest :: ByteString -> Request -> IO (ByteSegments, HeaderList)
+makeRequest
+  :: ByteString
+  -> Request
+  -> IO (ByteSegments, HeaderList)
 makeRequest authority req = do
     let go ct obj = case obj of
             (RequestBodyBS bs)  -> pure $
@@ -99,15 +103,13 @@ makeRequest authority req = do
                     [ ("Content-Type", renderHeader ct)
                     , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
                     ])
-            (RequestBodyLBS lbs) ->
-                let bs = toStrict lbs in pure $
-                (onlySegment bs,
+            (RequestBodyLBS lbs) -> pure $
+                (multiSegments $ toChunks lbs,
                     [ ("Content-Type", renderHeader ct)
-                    , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
                     ])
             (RequestBodyBuilder n builder) ->
-                let bs = toLazyByteString builder in pure $
-                (multiSegments $ toChunks bs,
+                let lbs = toLazyByteString builder in pure $
+                (multiSegments $ toChunks lbs,
                     [ ("Content-Type", renderHeader ct)
                     , ("Content-Length", ByteString.pack $ show n)
                     ])
