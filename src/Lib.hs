@@ -156,6 +156,9 @@ makeRequest authority req = do
         ]
     reqHeaders = [(CI.original h, hv) | (h,hv) <- toList (requestHeaders req)]
 
+resetPushPromises :: PushPromiseHandler
+resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
+
 -- | Implementation of simple requests.
 performRequest :: Request -> H2ClientM Response
 performRequest req = do
@@ -163,7 +166,6 @@ performRequest req = do
     let icfc = _incomingFlowControl http2client
     let ocfc = _outgoingFlowControl http2client
     let headersFlags = id
-    let resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
 
     (headersPairs, bodyIO) <- liftIO $ makeRequest authority req
     http2rsp <- liftIO $ withHttp2Stream http2client $ \stream ->
@@ -176,6 +178,8 @@ performRequest req = do
                 pure $ fromStreamResult streamResult
         in (StreamDefinition initStream handler)
     case http2rsp of
+            Left (TooMuchConcurrency _) ->
+                throwError $ Servant.Client.Core.ConnectionError "too many concurrent streams"
             Right (Right (hdrs,body,_))
                 | let Just status = lookupStatus hdrs -> do
                     let response = mkResponse status hdrs body
@@ -185,19 +189,29 @@ performRequest req = do
                 | otherwise -> do
                     let response = mkResponse 0 hdrs body
                     throwError $ DecodeFailure "no :status header" response
-            Left (TooMuchConcurrency _) ->
-                throwError $ Servant.Client.Core.ConnectionError "too many concurrent streams"
-
             Right (Left err) ->
                 throwError $ Servant.Client.Core.ConnectionError $ "connection error: " <> (Text.pack $ show $ toErrorCodeId err)
-  where
-    mkResponse status hdrs body =
-        Response (Status status "")
-                 (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ])
-                 http20
-                 (fromStrict body)
-    lookupStatus = lookup ":status" >=> readMaybe . ByteString.unpack
 
+mkResponse :: Int -> HeaderList -> ByteString -> Response
+mkResponse status hdrs body =
+    Response (Status status "")
+             (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ])
+             http20
+             (fromStrict body)
+
+lookupStatus :: HeaderList -> Maybe Int
+lookupStatus = lookup ":status" >=> readMaybe . ByteString.unpack
+
+replenishFlowControls
+  :: IncomingFlowControl -> IncomingFlowControl -> Int -> IO ()
+replenishFlowControls icfc isfc len = do
+    _ <- _consumeCredit isfc len
+    _addCredit isfc len
+    _ <- _updateWindow isfc
+    _ <- _consumeCredit icfc len
+    _addCredit icfc len
+    _ <- _updateWindow icfc
+    pure ()
 
 -- | Implementation of requests with streaming replies.
 performStreamingRequest :: Request -> H2ClientM StreamingResponse
@@ -213,36 +227,86 @@ performStreamingRequest req = do
         let initStream =
                 headers stream headersPairs headersFlags
             handler isfc osfc = do
-                isFinished <- newIORef False
-                let nextChunk = do
-                        done <- readIORef isFinished
-                        if done
-                        then pure ""
-                        else do
-                            ev <- _waitEvent stream
-                            case ev of
-                                (StreamDataEvent frameHeader dat) -> do
-                                    _addCredit isfc (ByteString.length dat)
-                                    _ <- _consumeCredit isfc (ByteString.length dat)
-                                    _ <- _updateWindow isfc
-                                    _addCredit icfc (ByteString.length dat)
-                                    _ <- _updateWindow icfc
-                                    when (testEndStream $ flags frameHeader) $
-                                        writeIORef isFinished True
-                                    pure dat
+                -- Send the request
                 sendSegments http2client stream ocfc osfc bodyIO
                 sendData http2client stream setEndStream ""
+                -- Waits for headers and returns the response object to the
+                -- caller.
                 pure $ StreamingResponse (\handleGenResponse -> do
                     ev <- _waitEvent stream
                     case ev of
-                        (StreamHeadersEvent frameHeader hdrs) -> do
-                             when (testEndStream $ flags frameHeader) $
-                                 writeIORef isFinished True
-                             let Just status = readMaybe . ByteString.unpack =<< lookup ":status" hdrs
-                             handleGenResponse $ Response (Status status "") (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ]) http20 nextChunk)
+                        (StreamHeadersEvent frameHeader hdrs) -> handleHeaders stream icfc isfc frameHeader hdrs handleGenResponse
+                        _ -> throwIO $ Servant.Client.Core.ConnectionError $ "unwanted event received in data stream" <> Text.pack (show ev)
+                        )
         in (StreamDefinition initStream handler)
     case ret of
         Right ret -> pure ret
+        Left (TooMuchConcurrency _) ->
+            throwError $ Servant.Client.Core.ConnectionError "too many concurrent streams"
+  where
+    handleHeaders stream icfc isfc frameHeader hdrs handleGenResponse
+        | let Just status = lookupStatus hdrs = do
+            isFinished <- newIORef False
+            when (testEndStream $ flags frameHeader) $
+                writeIORef isFinished True
+            let response = mkStreamResponse status hdrs isFinished stream icfc isfc
+            unless (status >= 200 && status < 300) $ do
+                wholeBody <- consumeBody status hdrs stream icfc isfc
+                let response = mkResponse status hdrs wholeBody
+                throwIO $ FailureResponse response
+            handleGenResponse response
+        | otherwise = do
+            wholeBody <- consumeBody 0 hdrs stream icfc isfc
+            let response = mkResponse 0 hdrs wholeBody
+            throwIO $ DecodeFailure "no :status header" response
+
+    -- | Helper to consume the whole response body when the status is not a 2xx.
+    -- This consumption can itself fail.
+    consumeBody status hdrs stream icfc isfc = do
+        (revBss,_) <- waitDataFrames stream icfc isfc []
+        let bs = mconcat $ reverse revBss
+        pure bs
+
+    -- | Helper to iteratively eat all data frames.
+    waitDataFrames stream icfc isfc xs = do
+        ev <- _waitEvent stream
+        case ev of
+            StreamDataEvent fh x
+                | testEndStream (flags fh) ->
+                    return (x:xs, Nothing)
+                | otherwise                -> do
+                    replenishFlowControls icfc isfc (payloadLength fh)
+                    waitDataFrames stream icfc isfc (x:xs)
+            StreamPushPromiseEvent _ ppSid ppHdrs -> do
+                _handlePushPromise stream ppSid ppHdrs resetPushPromises
+                waitDataFrames stream icfc isfc xs
+            StreamHeadersEvent _ hdrs ->
+                return (xs, Just hdrs)
+            _ -> throwIO $ Servant.Client.Core.ConnectionError $ "unwanted event received in data stream" <> Text.pack (show ev)
+
+    -- | Function to get the next DATA chunk on a stream this function is
+    -- stateful and modifies an IORef to remember that the stream is closed on
+    -- the server side.
+    -- Do not copy-paste this utility method unless you understand that the
+    -- IORef must be entirely owned by this function.
+    nextChunk isFinished stream icfc isfc = do
+        done <- readIORef isFinished
+        if done
+        then pure ""
+        else do
+            ev <- _waitEvent stream
+            case ev of
+                (StreamDataEvent fh dat) -> do
+                    replenishFlowControls icfc isfc (payloadLength fh)
+                    when (testEndStream $ flags fh) $
+                        writeIORef isFinished True
+                    pure dat
+                _ -> throwIO $ Servant.Client.Core.ConnectionError $ "unwanted event received in data stream" <> Text.pack (show ev)
+
+    mkStreamResponse status hdrs isFinished stream icfc isfc =
+        Response (Status status "") (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ]) http20 (nextChunk isFinished stream icfc isfc)
+
+
 
 h2client :: HasClient H2ClientM api => Proxy api -> Client H2ClientM api
 h2client api = api `clientIn` (Proxy :: Proxy H2ClientM)
