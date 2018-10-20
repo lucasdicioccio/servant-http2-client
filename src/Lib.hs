@@ -77,20 +77,14 @@ sendSegments http2client stream ocfc osfc segments =
   where
     go getChunk = do
         dat <- getChunk
-        if ByteString.null dat
-        then sendData http2client stream setEndStream dat
-        else upload dat id http2client ocfc stream osfc
+        upload dat id http2client ocfc stream osfc
 
 onlySegment :: ByteString -> ByteSegments
-onlySegment bs
-  | ByteString.null bs = \handle -> handle (pure "")
-  | otherwise          = \handle -> handle (pure bs) >> handle (pure "")
+onlySegment bs handle = handle (pure bs)
 
 multiSegments :: [ByteString] -> ByteSegments
-multiSegments []  = \handle -> handle (pure "")
-multiSegments bss = \handle -> do
+multiSegments bss handle =
     traverse_ (handle . pure) (filter (not . ByteString.null) bss)
-    handle (pure "")
 
 makeRequest
   :: ByteString
@@ -156,6 +150,7 @@ performRequest req = do
                 headers stream headersPairs headersFlags
             handler isfc osfc = do
                 sendSegments http2client stream ocfc osfc bodyIO
+                sendData http2client stream setEndStream ""
                 streamResult <- waitStream stream icfc resetPushPromises
                 pure $ fromStreamResult streamResult
         in (StreamDefinition initStream handler)
@@ -196,6 +191,7 @@ performStreamingRequest req = do
                                         writeIORef isFinished True
                                     pure dat
                 sendSegments http2client stream ocfc osfc bodyIO
+                sendData http2client stream setEndStream ""
                 pure $ StreamingResponse (\handleGenResponse -> do
                     ev <- _waitEvent stream
                     case ev of
