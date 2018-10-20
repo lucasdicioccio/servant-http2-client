@@ -23,21 +23,17 @@ dependencies:
 - base >= 4.7 && < 5
 - binary
 - bytestring
+- case-insensitive
 - containers
-- data-default-class
 - exceptions
-- servant
+- http2
+- http2-client
+- http-media
+- http-types
+- mtl
 - servant-client-core
 - text
 - transformers
-- mtl
-- http2
-- http2-client
-- http-types
-- http-media
-- case-insensitive
-- tls
-- aeson
 
 library:
   source-dirs: src
@@ -54,8 +50,12 @@ executables:
     - -rtsopts
     - -with-rtsopts=-N
     dependencies:
+    - aeson
+    - data-default-class
+    - servant
     - servant-http2-client
     - servant-client-core
+    - tls
 
 tests:
   servant-http2-client-test:
