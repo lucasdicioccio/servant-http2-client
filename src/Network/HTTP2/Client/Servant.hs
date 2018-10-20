@@ -1,57 +1,47 @@
-{-# LANGUAGE DataKinds      #-}
-{-# LANGUAGE TypeOperators  #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE InstanceSigs   #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving   #-}
-{-# LANGUAGE DeriveGeneric   #-}
-{-# LANGUAGE FlexibleContexts   #-}
-{-# LANGUAGE FlexibleInstances   #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE MultiParamTypeClasses   #-}
-module Lib
-    ( someFunc
-    ) where
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE InstanceSigs #-}
+{-# LANGUAGE OverloadedStrings #-}
 
-import           Data.IORef
-import           Data.Foldable
+module Network.HTTP2.Client.Servant (
+    H2ClientM
+  , runH2ClientM
+  , H2ClientEnv (..)
+  -- * generate functions
+  , h2client
+  ) where
+
+import           Data.IORef (newIORef, readIORef, writeIORef)
+import           Data.Foldable (traverse_)
 import           Control.Exception (throwIO)
-import           Control.Monad (unless)
-import           Control.Monad.Catch
-import           Control.Monad.IO.Class
-import           Control.Monad.Trans.Except
+import           Control.Monad (unless, when, (>=>))
+import           Control.Monad.Catch (MonadCatch, MonadThrow)
+import           Control.Monad.IO.Class (MonadIO, liftIO)
+import           Control.Monad.Trans.Except (ExceptT, runExceptT)
 import           Control.Monad.Error.Class   (MonadError (..))
-import           Control.Monad.Reader
-import           Data.Aeson (eitherDecode)
+import           Control.Monad.Reader (MonadReader, ReaderT, ask, runReaderT)
 import           Data.Binary.Builder (toLazyByteString)
-import           Data.ByteString.Builder
 import           Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.ByteString.Lazy (fromStrict, toStrict, toChunks)
-import qualified Data.ByteString.Lazy as LByteString
-import           Data.Default.Class (def)
 import           Data.Foldable (toList)
+import           Data.Proxy (Proxy(..))
 import           Data.Sequence (fromList)
-import           Data.Text (Text)
 import qualified Data.Text as Text
-import           Data.Text.Encoding as Encoding
-import           GHC.Generics
-import           Servant.API
-import           Servant.Client.Core
-import           Servant.Client.Core.Internal.RunClient
-import           Network.HPACK
-import           Network.HTTP.Media.RenderHeader
-import           Network.HTTP2
-import           Network.HTTP2.Client
-import           Network.HTTP2.Client.Helpers
-import           Network.HTTP.Types.Status
-import           Network.HTTP.Types.Version
-import qualified Network.TLS as TLS
-import qualified Network.TLS.Extra.Cipher as TLS
+import           GHC.Generics (Generic)
+import           Network.HPACK (HeaderList)
+import           Network.HTTP.Media.RenderHeader (renderHeader)
+import           Network.HTTP2 (flags, setEndStream, testEndStream, payloadLength, toErrorCodeId, ErrorCodeId(RefusedStream))
+import           Network.HTTP2.Client.Helpers (upload, waitStream, fromStreamResult)
+import           Network.HTTP.Types.Status (Status(..))
+import           Network.HTTP.Types.Version (http20)
 import qualified Data.CaseInsensitive as CI
-import           Text.Read
+import           Text.Read (readMaybe)
 
-import           Data.Aeson (FromJSON,ToJSON)
-import           Data.Proxy
+
+import           Network.HTTP2.Client
+import           Servant.Client.Core
 
 newtype H2ClientM a = H2ClientM
   { unH2ClientM :: ReaderT H2ClientEnv (ExceptT ServantError IO) a }
@@ -171,7 +161,7 @@ performRequest req = do
     http2rsp <- liftIO $ withHttp2Stream http2client $ \stream ->
         let initStream =
                 headers stream headersPairs headersFlags
-            handler isfc osfc = do
+            handler _ osfc = do
                 sendSegments http2client stream ocfc osfc bodyIO
                 sendData http2client stream setEndStream ""
                 streamResult <- waitStream stream icfc resetPushPromises
@@ -220,7 +210,6 @@ performStreamingRequest req = do
     let icfc = _incomingFlowControl http2client
     let ocfc = _outgoingFlowControl http2client
     let headersFlags = id
-    let resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
 
     (headersPairs, bodyIO) <- liftIO $ makeRequest authority req
     ret <- liftIO $ withHttp2Stream http2client $ \stream ->
@@ -235,34 +224,34 @@ performStreamingRequest req = do
                 pure $ StreamingResponse (\handleGenResponse -> do
                     ev <- _waitEvent stream
                     case ev of
-                        (StreamHeadersEvent frameHeader hdrs) -> handleHeaders stream icfc isfc frameHeader hdrs handleGenResponse
+                        (StreamHeadersEvent fh hdrs) -> handleHeaders stream icfc isfc fh hdrs handleGenResponse
                         _ -> throwIO $ Servant.Client.Core.ConnectionError $ "unwanted event received in data stream" <> Text.pack (show ev)
                         )
         in (StreamDefinition initStream handler)
     case ret of
-        Right ret -> pure ret
+        Right streamingResp -> pure streamingResp
         Left (TooMuchConcurrency _) ->
             throwError $ Servant.Client.Core.ConnectionError "too many concurrent streams"
   where
-    handleHeaders stream icfc isfc frameHeader hdrs handleGenResponse
+    handleHeaders stream icfc isfc fh hdrs handleGenResponse
         | let Just status = lookupStatus hdrs = do
             isFinished <- newIORef False
-            when (testEndStream $ flags frameHeader) $
+            when (testEndStream $ flags fh) $
                 writeIORef isFinished True
             let response = mkStreamResponse status hdrs isFinished stream icfc isfc
             unless (status >= 200 && status < 300) $ do
-                wholeBody <- consumeBody status hdrs stream icfc isfc
-                let response = mkResponse status hdrs wholeBody
-                throwIO $ FailureResponse response
+                wholeBody <- consumeBody stream icfc isfc
+                let failResponse = mkResponse status hdrs wholeBody
+                throwIO $ FailureResponse failResponse
             handleGenResponse response
         | otherwise = do
-            wholeBody <- consumeBody 0 hdrs stream icfc isfc
+            wholeBody <- consumeBody stream icfc isfc
             let response = mkResponse 0 hdrs wholeBody
             throwIO $ DecodeFailure "no :status header" response
 
     -- | Helper to consume the whole response body when the status is not a 2xx.
     -- This consumption can itself fail.
-    consumeBody status hdrs stream icfc isfc = do
+    consumeBody stream icfc isfc = do
         (revBss,_) <- waitDataFrames stream icfc isfc []
         let bs = mconcat $ reverse revBss
         pure bs
@@ -306,62 +295,5 @@ performStreamingRequest req = do
     mkStreamResponse status hdrs isFinished stream icfc isfc =
         Response (Status status "") (fromList [ (CI.mk h, hv) | (h,hv) <- hdrs ]) http20 (nextChunk isFinished stream icfc isfc)
 
-
-
 h2client :: HasClient H2ClientM api => Proxy api -> Client H2ClientM api
 h2client api = api `clientIn` (Proxy :: Proxy H2ClientM)
-
---- usage ---
---
-data RawText
-instance Accept RawText where
-  contentType _ = "text/plain"
-instance MimeRender RawText Text where
-  mimeRender _ = fromStrict . Encoding.encodeUtf8
-instance MimeUnrender RawText Text where
-  mimeUnrender _ = pure . Encoding.decodeUtf8 . toStrict
-instance MimeUnrender OctetStream Text where
-  mimeUnrender _ = pure . Encoding.decodeUtf8 . toStrict
-
-type Http2Golang =
-       "reqinfo" :> Get '[RawText] Text
-  :<|> "goroutines" :> StreamGet NewlineFraming RawText (ResultStream Text)
-  :<|> "ECHO" :> ReqBody '[RawText] Text :> Put '[OctetStream] Text
-
-myApi :: Proxy Http2Golang
-myApi = Proxy
-
-getExample :: H2ClientM Text
-getGoroutines :: H2ClientM (ResultStream Text)
-capitalize :: Text -> H2ClientM Text
-getExample :<|> getGoroutines :<|> capitalize = h2client myApi
-
-someFunc :: IO ()
-someFunc = do
-    frameConn <- newHttp2FrameConnection "http2.golang.org" 443 (Just tlsParams)
-    client <- newHttp2Client frameConn 8192 8192 [] defaultGoAwayHandler ignoreFallbackHandler
-    let env = H2ClientEnv "http2.golang.org" client
-    runH2ClientM getExample env >>= print
-    runH2ClientM (capitalize "shout me something back") env >>= print
-    runH2ClientM getGoroutines env >>= go
-  where
-    go :: Either ServantError (ResultStream Text) -> IO ()
-    go (Left err) = print err
-    go (Right (ResultStream k)) = k $ \getResult ->
-       let loop = do
-            r <- getResult
-            case r of
-                Nothing -> return ()
-                Just x -> print x >> loop
-       in loop
-    tlsParams = TLS.ClientParams {
-          TLS.clientWantSessionResume    = Nothing
-        , TLS.clientUseMaxFragmentLength = Nothing
-        , TLS.clientServerIdentification = ("http2.golang.org", ByteString.pack $ show "443")
-        , TLS.clientUseServerNameIndication = True
-        , TLS.clientShared               = def
-        , TLS.clientHooks                = def { TLS.onServerCertificate = \_ _ _ _ -> return []
-                                               }
-        , TLS.clientSupported            = def { TLS.supportedCiphers = TLS.ciphersuite_default }
-        , TLS.clientDebug                = def
-        }
