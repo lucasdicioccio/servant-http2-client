@@ -72,6 +72,28 @@ data H2ClientEnv = H2ClientEnv ByteString Http2Client
 
 type ByteSegments = (IO ByteString -> IO ()) -> IO ()
 
+-- | Construct a ByteSegments from a single ByteString.
+onlySegment :: ByteString -> ByteSegments
+onlySegment bs handle = handle (pure bs)
+
+-- | Construct a ByteSegments from a lazy list of ByteString.
+--
+-- Since we expect the handler passed to ByteSegments to do some IO, empty
+-- chunks are discarded to save on IOs.
+multiSegments :: [ByteString] -> ByteSegments
+multiSegments bss handle =
+    traverse_ (handle . pure) (filter (not . ByteString.null) bss)
+
+-- | Pulls data segments from ByteSegments and calls 'upload' on it.
+sendSegments
+  :: Http2Client
+  -> Http2Stream
+  -> OutgoingFlowControl
+  -- ^ Connection
+  -> OutgoingFlowControl
+  -- ^ Stream
+  -> ByteSegments
+  -> IO ()
 sendSegments http2client stream ocfc osfc segments =
     segments go
   where
@@ -79,17 +101,13 @@ sendSegments http2client stream ocfc osfc segments =
         dat <- getChunk
         upload dat id http2client ocfc stream osfc
 
-onlySegment :: ByteString -> ByteSegments
-onlySegment bs handle = handle (pure bs)
-
-multiSegments :: [ByteString] -> ByteSegments
-multiSegments bss handle =
-    traverse_ (handle . pure) (filter (not . ByteString.null) bss)
-
+-- | Prepare an HTTP2 request to a given server.
 makeRequest
   :: ByteString
+  -- ^ Server's Authority.
   -> Request
-  -> IO (ByteSegments, HeaderList)
+  -- ^ The HTTP request.
+  -> IO (HeaderList, ByteSegments)
 makeRequest authority req = do
     let go ct obj = case obj of
             (RequestBodyBS bs)  -> pure $
@@ -124,7 +142,7 @@ makeRequest authority req = do
                                 Nothing       -> pure (onlySegment "", [])
                                 (Just (r,ct)) -> go ct r
     let headersPairs = baseHeaders <> reqHeaders <> bodyheaders
-    pure (bodyIO, headersPairs)
+    pure (headersPairs, bodyIO)
   where
     baseHeaders =
         [ (":method", requestMethod req)
@@ -144,7 +162,7 @@ performRequest req = do
     let headersFlags = id
     let resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
 
-    (bodyIO, headersPairs) <- liftIO $ makeRequest authority req
+    (headersPairs, bodyIO) <- liftIO $ makeRequest authority req
     http2rsp <- liftIO $ withHttp2Stream http2client $ \stream ->
         let initStream =
                 headers stream headersPairs headersFlags
@@ -168,7 +186,7 @@ performStreamingRequest req = do
     let headersFlags = id
     let resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
 
-    (bodyIO, headersPairs) <- liftIO $ makeRequest authority req
+    (headersPairs, bodyIO) <- liftIO $ makeRequest authority req
     ret <- liftIO $ withHttp2Stream http2client $ \stream ->
         let initStream =
                 headers stream headersPairs headersFlags
@@ -207,6 +225,8 @@ performStreamingRequest req = do
 h2client :: HasClient H2ClientM api => Proxy api -> Client H2ClientM api
 h2client api = api `clientIn` (Proxy :: Proxy H2ClientM)
 
+--- usage ---
+--
 data RawText
 instance Accept RawText where
   contentType _ = "text/plain"
@@ -217,7 +237,6 @@ instance MimeUnrender RawText Text where
 instance MimeUnrender OctetStream Text where
   mimeUnrender _ = pure . Encoding.decodeUtf8 . toStrict
 
---- usage ---
 type Http2Golang =
        "reqinfo" :> Get '[RawText] Text
   :<|> "goroutines" :> StreamGet NewlineFraming RawText (ResultStream Text)
@@ -260,4 +279,3 @@ someFunc = do
         , TLS.clientSupported            = def { TLS.supportedCiphers = TLS.ciphersuite_default }
         , TLS.clientDebug                = def
         }
-
