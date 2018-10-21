@@ -2,10 +2,10 @@
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: e352f7dda8407f7f694c6418b746407bfd6e634a996cd13a2dba4fdf7164dcc0
+-- hash: 6b01395f8a2a1378dbcf88243a058468c5b3e6464cf2bd933080fb9ee96e9d77
 
 name:           servant-http2-client
-version:        0.1.0.1
+version:        0.1.0.2
 synopsis:       Generate HTTP2 clients from Servant API descriptions.
 description:    Please see the README on GitHub at <https://github.com/lucasdicioccio/servant-http2-client#readme>
 category:       Web
