@@ -38,7 +38,6 @@ import           Network.HTTP2.Client.Helpers (upload, waitStream, fromStreamRes
 import           Network.HTTP.Types.Status (Status(..))
 import           Network.HTTP.Types.Version (http20)
 import qualified Data.CaseInsensitive as CI
-import           Text.Read (readMaybe)
 
 
 import           Network.HTTP2.Client
@@ -192,8 +191,9 @@ mkResponse status hdrs body =
              http20
              (fromStrict body)
 
+{-# INLINEABLE lookupStatus #-}
 lookupStatus :: HeaderList -> Maybe Int
-lookupStatus = lookup ":status" >=> readMaybe . ByteString.unpack
+lookupStatus = lookup ":status" >=> fmap fst . ByteString.readInt
 
 replenishFlowControls
   :: IncomingFlowControl -> IncomingFlowControl -> Int -> IO ()
@@ -201,8 +201,8 @@ replenishFlowControls icfc isfc len = do
     _ <- _consumeCredit isfc len
     _addCredit isfc len
     _ <- _updateWindow isfc
-    _ <- _consumeCredit icfc len
-    _addCredit icfc len
+    -- connection-level flow control already accounted for in the
+    -- 'creditDataFramesStep' of 'dispatchLoop' in http2-client
     _ <- _updateWindow icfc
     pure ()
 
