@@ -13,6 +13,7 @@ module Network.HTTP2.Client.Servant (
   ) where
 
 import           Data.IORef (newIORef, readIORef, writeIORef)
+import           Data.Maybe (isJust)
 import           Data.Foldable (traverse_)
 import           Control.Exception (throwIO)
 import           Control.Monad (unless, when, (>=>))
@@ -77,7 +78,8 @@ multiSegments bss handle =
     traverse_ (handle . pure) (filter (not . ByteString.null) bss)
 
 -- | Pulls data segments from ByteSegments and calls 'upload' on it.
-sendSegments
+-- Ignores empty segments.
+sendNonEmptySegments
   :: Http2Client
   -> Http2Stream
   -> OutgoingFlowControl
@@ -86,12 +88,12 @@ sendSegments
   -- ^ Stream
   -> ByteSegments
   -> IO ()
-sendSegments http2client stream ocfc osfc segments =
+sendNonEmptySegments http2client stream ocfc osfc segments =
     segments go
   where
     go getChunk = do
         dat <- getChunk
-        upload dat id http2client ocfc stream osfc
+        when (not $ ByteString.null dat) $ upload dat id http2client ocfc stream osfc
 
 -- | Prepare an HTTP2 request to a given server.
 makeRequest
@@ -99,31 +101,31 @@ makeRequest
   -- ^ Server's Authority.
   -> Request
   -- ^ The HTTP request.
-  -> IO (HeaderList, ByteSegments)
+  -> IO (HeaderList, Maybe ByteSegments)
 makeRequest authority req = do
     let go ct obj = case obj of
             (RequestBodyBS bs)  -> pure $
-                (onlySegment bs,
+                (Just $ onlySegment bs,
                     [ ("Content-Type", renderHeader ct)
                     , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
                     ])
             (RequestBodyLBS lbs) -> pure $
-                (multiSegments $ toChunks lbs,
+                (Just $ multiSegments $ toChunks lbs,
                     [ ("Content-Type", renderHeader ct)
                     ])
             (RequestBodyBuilder n builder) ->
                 let lbs = toLazyByteString builder in pure $
-                (multiSegments $ toChunks lbs,
+                (Just $ multiSegments $ toChunks lbs,
                     [ ("Content-Type", renderHeader ct)
                     , ("Content-Length", ByteString.pack $ show n)
                     ])
             (RequestBodyStream n act) -> pure $
-                (act,
+                (Just act,
                     [ ("Content-Type", renderHeader ct)
                     , ("Content-Length", ByteString.pack $ show n)
                     ])
             (RequestBodyStreamChunked act) -> pure $
-                (act,
+                (Just act,
                     [ ("Content-Type", renderHeader ct)
                     , ("Transfer-Encoding", "chunked")
                     ])
@@ -131,7 +133,7 @@ makeRequest authority req = do
                 again >>= go ct
 
     (bodyIO,bodyheaders) <- case requestBody req of
-                                Nothing       -> pure (onlySegment "", [])
+                                Nothing       -> pure (Nothing, [])
                                 (Just (r,ct)) -> go ct r
     let headersPairs = baseHeaders <> reqHeaders <> bodyheaders
     pure (headersPairs, bodyIO)
@@ -155,15 +157,16 @@ performRequest req = do
     H2ClientEnv authority http2client <- ask
     let icfc = _incomingFlowControl http2client
     let ocfc = _outgoingFlowControl http2client
-    let headersFlags = id
 
-    (headersPairs, bodyIO) <- liftIO $ makeRequest authority req
+    (headersPairs, mBodyIO) <- liftIO $ makeRequest authority req
+    let headersFlags = if isJust mBodyIO then id else setEndStream
     http2rsp <- liftIO $ withHttp2Stream http2client $ \stream ->
         let initStream =
                 headers stream headersPairs headersFlags
             handler _ osfc = do
-                sendSegments http2client stream ocfc osfc bodyIO
-                sendData http2client stream setEndStream ""
+                flip traverse_ mBodyIO (\bodyIO -> do
+                    sendNonEmptySegments http2client stream ocfc osfc bodyIO
+                    sendData http2client stream setEndStream "")
                 streamResult <- waitStream stream icfc resetPushPromises
                 pure $ fromStreamResult streamResult
         in (StreamDefinition initStream handler)
@@ -209,16 +212,16 @@ performStreamingRequest req = do
     H2ClientEnv authority http2client <- ask
     let icfc = _incomingFlowControl http2client
     let ocfc = _outgoingFlowControl http2client
-    let headersFlags = id
-
-    (headersPairs, bodyIO) <- liftIO $ makeRequest authority req
+    (headersPairs, mBodyIO) <- liftIO $ makeRequest authority req
+    let headersFlags = if isJust mBodyIO then id else setEndStream
     ret <- liftIO $ withHttp2Stream http2client $ \stream ->
         let initStream =
                 headers stream headersPairs headersFlags
             handler isfc osfc = do
                 -- Send the request
-                sendSegments http2client stream ocfc osfc bodyIO
-                sendData http2client stream setEndStream ""
+                flip traverse_ mBodyIO (\bodyIO -> do
+                    sendNonEmptySegments http2client stream ocfc osfc bodyIO
+                    sendData http2client stream setEndStream "")
                 -- Waits for headers and returns the response object to the
                 -- caller.
                 pure $ StreamingResponse (\handleGenResponse -> do
