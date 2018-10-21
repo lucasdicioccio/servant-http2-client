@@ -23,6 +23,7 @@ import           Control.Monad.Trans.Except (ExceptT, runExceptT)
 import           Control.Monad.Error.Class   (MonadError (..))
 import           Control.Monad.Reader (MonadReader, ReaderT, ask, runReaderT)
 import           Data.Binary.Builder (toLazyByteString)
+import           Data.ByteString.Builder (intDec, int64Dec)
 import           Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.ByteString.Lazy (fromStrict, toStrict, toChunks)
@@ -106,7 +107,7 @@ makeRequest authority req = do
             (RequestBodyBS bs)  -> pure $
                 (Just $ onlySegment bs,
                     [ ("Content-Type", renderHeader ct)
-                    , ("Content-Length", ByteString.pack $ show $ ByteString.length bs)
+                    , ("Content-Length", toStrict $ toLazyByteString $ intDec $ ByteString.length bs)
                     ])
             (RequestBodyLBS lbs) -> pure $
                 (Just $ multiSegments $ toChunks lbs,
@@ -116,12 +117,12 @@ makeRequest authority req = do
                 let lbs = toLazyByteString builder in pure $
                 (Just $ multiSegments $ toChunks lbs,
                     [ ("Content-Type", renderHeader ct)
-                    , ("Content-Length", ByteString.pack $ show n)
+                    , ("Content-Length", toStrict $ toLazyByteString $ int64Dec n)
                     ])
             (RequestBodyStream n act) -> pure $
                 (Just act,
                     [ ("Content-Type", renderHeader ct)
-                    , ("Content-Length", ByteString.pack $ show n)
+                    , ("Content-Length", toStrict $ toLazyByteString $ int64Dec n)
                     ])
             (RequestBodyStreamChunked act) -> pure $
                 (Just act,
@@ -142,7 +143,7 @@ makeRequest authority req = do
         , (":scheme", "https")
         , (":path", toStrict $ toLazyByteString $ requestPath req)
         , (":authority", authority)
-        , ("Accept", ByteString.intercalate "," $ toList $ fmap renderHeader $ requestAccept req)
+        , ("Accept", ByteString.intercalate "," $ fmap renderHeader $ toList $ requestAccept req)
         , ("User-Agent", "servant-http2-client/dev")
         ]
     reqHeaders = [(CI.original h, hv) | (h,hv) <- toList (requestHeaders req)]
