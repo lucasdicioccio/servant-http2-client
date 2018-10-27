@@ -1,5 +1,5 @@
 name:                servant-http2-client
-version:             0.1.0.2
+version:             0.1.0.3
 github:              "lucasdicioccio/servant-http2-client"
 license:             BSD3
 author:              "Lucas DiCioccio"
